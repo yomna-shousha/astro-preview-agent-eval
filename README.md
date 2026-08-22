@@ -2,7 +2,7 @@
 
 Small public harness for testing whether an agent can diagnose a Preview-only issue from GitHub PR evidence.
 
-The workflow deploys a Worker Preview, captures a Browser Run screenshot, sends correlated runtime requests, and posts an evidence-only PR comment with WOBS/debug/request IDs.
+The workflow deploys a Worker Preview, captures a screenshot, sends correlated runtime requests, and posts an evidence-only PR comment with WOBS/debug/request IDs.
 
 ## Commands
 

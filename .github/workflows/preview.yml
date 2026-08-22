@@ -32,6 +32,8 @@ jobs:
 
       - run: npm install --no-audit --no-fund
 
+      - run: npx playwright install --with-deps chromium
+
       - run: npm run build
 
       - name: Deploy Worker Preview
@@ -56,11 +58,9 @@ jobs:
           echo "preview_url=$PREVIEW_URL" >> "$GITHUB_OUTPUT"
           echo "deployment_id=$DEPLOYMENT_ID" >> "$GITHUB_OUTPUT"
 
-      - name: Capture screenshot with Browser Run
+      - name: Capture screenshot
         id: screenshot
         env:
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
           CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
           PREVIEW_URL: ${{ steps.deploy.outputs.preview_url }}
@@ -68,34 +68,29 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p preview-output
-          REQUEST=$(jq -nc \
-            --arg url "${PREVIEW_URL}?debugId=${DEBUG_ID}" \
-            --arg accessClientId "$CF_ACCESS_CLIENT_ID" \
-            --arg accessClientSecret "$CF_ACCESS_CLIENT_SECRET" \
-            '{
-            url: $url,
-            setExtraHTTPHeaders: {
-              "CF-Access-Client-Id": $accessClientId,
-              "CF-Access-Client-Secret": $accessClientSecret
-            },
-            viewport: { width: 1440, height: 1000 },
-            selector: "main"
-          }')
+          node <<'NODE'
+          const { chromium } = require('playwright');
 
-          STATUS=$(curl -sS \
-            -X POST "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/browser-rendering/screenshot" \
-            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
-            -H "Content-Type: application/json" \
-            -d "$REQUEST" \
-            --output preview-output/screenshot.png \
-            --write-out "%{http_code}")
+          (async () => {
+            const browser = await chromium.launch();
+            const page = await browser.newPage({
+              viewport: { width: 1440, height: 1000 },
+              extraHTTPHeaders: {
+                'CF-Access-Client-Id': process.env.CF_ACCESS_CLIENT_ID,
+                'CF-Access-Client-Secret': process.env.CF_ACCESS_CLIENT_SECRET,
+              },
+            });
 
-          if [ "$STATUS" -lt 200 ] || [ "$STATUS" -ge 300 ]; then
-            echo "::error::Browser Run screenshot request failed with HTTP ${STATUS}"
-            cat preview-output/screenshot.png
-            exit 1
-          fi
-
+            await page.goto(`${process.env.PREVIEW_URL}?debugId=${process.env.DEBUG_ID}`, {
+              waitUntil: 'networkidle',
+            });
+            await page.locator('main').screenshot({ path: 'preview-output/screenshot.png' });
+            await browser.close();
+          })().catch((error) => {
+            console.error(error);
+            process.exit(1);
+          });
+          NODE
           test -s preview-output/screenshot.png
           echo "debug_id=$DEBUG_ID" >> "$GITHUB_OUTPUT"
 
