@@ -1,4 +1,4 @@
-name: Worker Preview Evidence
+name: Worker Preview Coordinates
 
 on:
   pull_request:
@@ -32,8 +32,6 @@ jobs:
 
       - run: npm install --no-audit --no-fund
 
-      - run: npx playwright install --with-deps chromium
-
       - run: npm run build
 
       - name: Deploy Worker Preview
@@ -58,146 +56,22 @@ jobs:
           echo "preview_url=$PREVIEW_URL" >> "$GITHUB_OUTPUT"
           echo "deployment_id=$DEPLOYMENT_ID" >> "$GITHUB_OUTPUT"
 
-      - name: Capture screenshot
-        id: screenshot
-        env:
-          CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
-          CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
-          PREVIEW_URL: ${{ steps.deploy.outputs.preview_url }}
-          DEBUG_ID: pr-${{ github.event.pull_request.number }}-${{ github.run_id }}-${{ github.run_attempt }}
-        run: |
-          set -euo pipefail
-          mkdir -p preview-output
-          node <<'NODE'
-          const { chromium } = require('playwright');
-
-          (async () => {
-            const browser = await chromium.launch();
-            const page = await browser.newPage({
-              viewport: { width: 1440, height: 1000 },
-              extraHTTPHeaders: {
-                'CF-Access-Client-Id': process.env.CF_ACCESS_CLIENT_ID,
-                'CF-Access-Client-Secret': process.env.CF_ACCESS_CLIENT_SECRET,
-              },
-            });
-
-            await page.goto(`${process.env.PREVIEW_URL}?debugId=${process.env.DEBUG_ID}`, {
-              waitUntil: 'networkidle',
-            });
-            await page.locator('main').screenshot({ path: 'preview-output/screenshot.png' });
-            await browser.close();
-          })().catch((error) => {
-            console.error(error);
-            process.exit(1);
-          });
-          NODE
-          test -s preview-output/screenshot.png
-          echo "debug_id=$DEBUG_ID" >> "$GITHUB_OUTPUT"
-
-      - name: Probe Preview runtime
-        id: runtime-probe
-        env:
-          CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
-          CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
-          PREVIEW_URL: ${{ steps.deploy.outputs.preview_url }}
-          DEBUG_ID: ${{ steps.screenshot.outputs.debug_id }}
-        run: |
-          set -euo pipefail
-          mkdir -p preview-output
-
-          probe() {
-            local name="$1"
-            local path="$2"
-            local output="preview-output/${name}.json"
-            local status
-
-            status=$(curl -sS \
-              -H "CF-Access-Client-Id: ${CF_ACCESS_CLIENT_ID}" \
-              -H "CF-Access-Client-Secret: ${CF_ACCESS_CLIENT_SECRET}" \
-              -H "x-debug-id: ${DEBUG_ID}" \
-              "${PREVIEW_URL}${path}?debugId=${DEBUG_ID}" \
-              --output "$output" \
-              --write-out "%{http_code}" || true)
-
-            local request_id
-            request_id=$(jq -r '.requestId // "unknown"' "$output")
-            local snippet
-            snippet=$(jq -c . "$output" | cut -c 1-300)
-
-            printf '%s\t%s\t%s\t%s\t%s\n' "$name" "$path" "$status" "$request_id" "$snippet" >> preview-output/probes.tsv
-          }
-
-          : > preview-output/probes.tsv
-          probe health /api/health
-          probe catalog /api/catalog/sync
-          probe quote /api/checkout/quote
-
-          {
-            echo 'probes<<EOF'
-            node <<'NODE'
-          const fs = require('node:fs');
-          const rows = fs.readFileSync('preview-output/probes.tsv', 'utf8').trim().split('\n').filter(Boolean);
-          console.log(rows.map((row) => {
-            const [name, path, status, requestId, snippet] = row.split('\t');
-            return `| ${name} | \`${path}\` | \`${status}\` | \`${requestId}\` | \`${snippet.replaceAll('|', '\\|')}\` |`;
-          }).join('\n'));
-          NODE
-            echo EOF
-          } >> "$GITHUB_OUTPUT"
-
-      - name: Publish screenshot for PR comment
-        id: publish-screenshot
-        env:
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          ARTIFACT_BRANCH: preview-artifacts-pr-${{ github.event.pull_request.number }}
-        run: |
-          set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          WORKTREE=$(mktemp -d)
-          if git ls-remote --exit-code --heads origin "$ARTIFACT_BRANCH" >/dev/null 2>&1; then
-            git fetch origin "$ARTIFACT_BRANCH"
-            git worktree add "$WORKTREE" "origin/$ARTIFACT_BRANCH"
-          else
-            git worktree add --detach "$WORKTREE"
-            git -C "$WORKTREE" switch --orphan "$ARTIFACT_BRANCH"
-            git -C "$WORKTREE" rm -rf . >/dev/null 2>&1 || true
-          fi
-
-          mkdir -p "$WORKTREE/screenshots"
-          SCREENSHOT_FILE="${GITHUB_SHA}.png"
-          cp preview-output/screenshot.png "$WORKTREE/screenshots/${SCREENSHOT_FILE}"
-          cp preview-output/screenshot.png "$WORKTREE/screenshots/latest.png"
-          git -C "$WORKTREE" add "screenshots/${SCREENSHOT_FILE}" screenshots/latest.png
-          git -C "$WORKTREE" commit -m "Update screenshot for PR ${PR_NUMBER}" || true
-          git -C "$WORKTREE" push origin "HEAD:$ARTIFACT_BRANCH"
-
-          SCREENSHOT_URL="https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${ARTIFACT_BRANCH}/screenshots/${SCREENSHOT_FILE}"
-          echo "screenshot_url=$SCREENSHOT_URL" >> "$GITHUB_OUTPUT"
-
       - name: Comment on PR
         uses: actions/github-script@v7
         env:
           PREVIEW_URL: ${{ steps.deploy.outputs.preview_url }}
           DEPLOYMENT_ID: ${{ steps.deploy.outputs.deployment_id }}
-          SCREENSHOT_URL: ${{ steps.publish-screenshot.outputs.screenshot_url }}
-          DEBUG_ID: ${{ steps.screenshot.outputs.debug_id }}
-          PROBES: ${{ steps.runtime-probe.outputs.probes }}
         with:
           script: |
             const marker = '<!-- worker-preview-evidence:astro-preview-agent-eval -->';
             const previewName = `pr-${context.issue.number}`;
             const branch = context.payload.pull_request.head.ref;
             const sha = context.payload.pull_request.head.sha.slice(0, 7);
-            const wobsPath = `/workers/services/view/${process.env.WORKER_NAME}/production/previews/${previewName}/observability/events`;
 
             const body = `${marker}
-            ## Preview Evidence
+            ## Preview Coordinates
 
             [Open the latest Preview](${process.env.PREVIEW_URL})
-
-            ![Automated screenshot of the Preview](${process.env.SCREENSHOT_URL})
 
             | Field | Value |
             | --- | --- |
@@ -206,16 +80,8 @@ jobs:
             | Commit | \`${sha}\` |
             | Deployment | \`${process.env.DEPLOYMENT_ID || 'unknown'}\` |
             | Worker | \`${process.env.WORKER_NAME}\` |
-            | Debug ID | \`${process.env.DEBUG_ID}\` |
-            | WOBS path | \`${wobsPath}\` |
 
-            ### Runtime Probes
-
-            | Probe | Path | Status | Request ID | Response snippet |
-            | --- | --- | --- | --- | --- |
-            ${process.env.PROBES}
-
-            Use the screenshot, Preview URL, WOBS path, debug ID, request IDs, and response snippets to decide whether this PR needs a code change.`;
+            CI only deployed the Preview. It did not capture screenshots, send application probes, query WOBS, or provide request IDs. An investigating agent must collect that evidence itself.`;
 
             const { data: comments } = await github.rest.issues.listComments({
               owner: context.repo.owner,
@@ -259,11 +125,6 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           PREVIEW_NAME: pr-${{ github.event.pull_request.number }}
         run: npx wrangler preview delete --name "$PREVIEW_NAME" --skip-confirmation || true
-
-      - name: Delete screenshot branch
-        env:
-          ARTIFACT_BRANCH: preview-artifacts-pr-${{ github.event.pull_request.number }}
-        run: git push origin --delete "$ARTIFACT_BRANCH" || true
 
   production:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
