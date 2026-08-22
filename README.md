@@ -15,3 +15,7 @@ The workflow only deploys a Worker Preview and posts the Preview coordinates. It
 ## Agent Eval
 
 Use `AGENT_EVAL_PROMPT.md` against the intentionally broken PR after the Preview Coordinates comment appears.
+
+## Sensor Eval
+
+Add the `sensor` label to a PR to run the separate `Worker Preview Sensor` workflow. That workflow deploys the Preview, captures a browser screenshot, sends runtime probes, attempts a GraphQL Workers metrics query, and posts the collected evidence back to the PR.

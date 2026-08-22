@@ -1,0 +1,367 @@
+name: Worker Preview Sensor
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, closed]
+
+concurrency:
+  group: worker-preview-sensor-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+env:
+  WORKER_NAME: astro-preview-agent-eval
+
+jobs:
+  sensor:
+    if: github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'sensor')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - run: npm install --no-audit --no-fund
+
+      - run: npx playwright install --with-deps chromium
+
+      - run: npm run build
+
+      - name: Deploy Worker Preview
+        id: deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          PREVIEW_NAME: pr-${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          OUTPUT=$(npx wrangler preview --json --name "$PREVIEW_NAME" --tag "${{ github.sha }}" --message "PR #${{ github.event.pull_request.number }} sensor preview")
+          printf '%s\n' "$OUTPUT"
+
+          PREVIEW_JSON=$(printf '%s' "$OUTPUT" | node -e 'const fs = require("node:fs"); const text = fs.readFileSync(0, "utf8"); const start = text.indexOf("{"); if (start < 0) process.exit(1); process.stdout.write(text.slice(start));')
+          PREVIEW_URL=$(printf '%s' "$PREVIEW_JSON" | jq -r '.preview.urls[0] // empty')
+          DEPLOYMENT_ID=$(printf '%s' "$PREVIEW_JSON" | jq -r '.deployment.id // empty')
+
+          if [ -z "$PREVIEW_URL" ]; then
+            echo "::error::Could not find a preview URL in wrangler output"
+            exit 1
+          fi
+
+          echo "preview_url=$PREVIEW_URL" >> "$GITHUB_OUTPUT"
+          echo "deployment_id=$DEPLOYMENT_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Capture browser screenshot
+        id: screenshot
+        env:
+          BROWSER_RENDERING_API_TOKEN: ${{ secrets.CLOUDFLARE_BROWSER_RENDERING_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+          PREVIEW_URL: ${{ steps.deploy.outputs.preview_url }}
+          DEBUG_ID: sensor-pr-${{ github.event.pull_request.number }}-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          mkdir -p preview-output
+
+          CAPTURE_SOURCE="playwright"
+          TOKEN="${BROWSER_RENDERING_API_TOKEN:-${CLOUDFLARE_API_TOKEN:-}}"
+
+          if [ -n "$TOKEN" ] && [ -n "${CLOUDFLARE_ACCOUNT_ID:-}" ]; then
+            REQUEST=$(jq -nc \
+              --arg url "${PREVIEW_URL}?debugId=${DEBUG_ID}" \
+              --arg accessClientId "$CF_ACCESS_CLIENT_ID" \
+              --arg accessClientSecret "$CF_ACCESS_CLIENT_SECRET" \
+              --arg debugId "$DEBUG_ID" \
+              '{
+              url: $url,
+              setExtraHTTPHeaders: {
+                "CF-Access-Client-Id": $accessClientId,
+                "CF-Access-Client-Secret": $accessClientSecret,
+                "x-debug-id": $debugId
+              },
+              viewport: { width: 1440, height: 1000 },
+              selector: "main"
+            }')
+
+            STATUS=$(curl -sS \
+              -X POST "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/browser-rendering/screenshot" \
+              -H "Authorization: Bearer ${TOKEN}" \
+              -H "Content-Type: application/json" \
+              -d "$REQUEST" \
+              --output preview-output/screenshot.png \
+              --write-out "%{http_code}" || true)
+
+            if [ "$STATUS" -ge 200 ] && [ "$STATUS" -lt 300 ] && [ -s preview-output/screenshot.png ]; then
+              CAPTURE_SOURCE="browser-rendering-api"
+            else
+              mv preview-output/screenshot.png preview-output/browser-rendering-error.txt 2>/dev/null || true
+            fi
+          fi
+
+          if [ "$CAPTURE_SOURCE" = "playwright" ]; then
+            node <<'NODE'
+          const { chromium } = require('playwright');
+
+          (async () => {
+            const browser = await chromium.launch();
+            const page = await browser.newPage({
+              viewport: { width: 1440, height: 1000 },
+              extraHTTPHeaders: {
+                'CF-Access-Client-Id': process.env.CF_ACCESS_CLIENT_ID,
+                'CF-Access-Client-Secret': process.env.CF_ACCESS_CLIENT_SECRET,
+                'x-debug-id': process.env.DEBUG_ID,
+              },
+            });
+
+            await page.goto(`${process.env.PREVIEW_URL}?debugId=${process.env.DEBUG_ID}`, {
+              waitUntil: 'networkidle',
+            });
+            await page.locator('main').screenshot({ path: 'preview-output/screenshot.png' });
+            await browser.close();
+          })().catch((error) => {
+            console.error(error);
+            process.exit(1);
+          });
+          NODE
+          fi
+
+          test -s preview-output/screenshot.png
+          echo "debug_id=$DEBUG_ID" >> "$GITHUB_OUTPUT"
+          echo "capture_source=$CAPTURE_SOURCE" >> "$GITHUB_OUTPUT"
+
+      - name: Probe Preview runtime
+        id: runtime-probe
+        env:
+          CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+          PREVIEW_URL: ${{ steps.deploy.outputs.preview_url }}
+          DEBUG_ID: ${{ steps.screenshot.outputs.debug_id }}
+        run: |
+          set -euo pipefail
+          mkdir -p preview-output
+
+          probe() {
+            local name="$1"
+            local path="$2"
+            local output="preview-output/${name}.json"
+            local status
+
+            status=$(curl -sS \
+              -H "CF-Access-Client-Id: ${CF_ACCESS_CLIENT_ID}" \
+              -H "CF-Access-Client-Secret: ${CF_ACCESS_CLIENT_SECRET}" \
+              -H "x-debug-id: ${DEBUG_ID}" \
+              "${PREVIEW_URL}${path}?debugId=${DEBUG_ID}" \
+              --output "$output" \
+              --write-out "%{http_code}" || true)
+
+            local request_id
+            request_id=$(jq -r '.requestId // "unknown"' "$output" 2>/dev/null || printf 'unknown')
+            local snippet
+            snippet=$(jq -c . "$output" 2>/dev/null | cut -c 1-300 || printf 'unparseable response')
+
+            printf '%s\t%s\t%s\t%s\t%s\n' "$name" "$path" "$status" "$request_id" "$snippet" >> preview-output/probes.tsv
+          }
+
+          : > preview-output/probes.tsv
+          probe health /api/health
+          probe catalog /api/catalog/sync
+          probe quote /api/checkout/quote
+
+          node <<'NODE' >> "$GITHUB_OUTPUT"
+          const fs = require('node:fs');
+          const rows = fs.readFileSync('preview-output/probes.tsv', 'utf8').trim().split('\n').filter(Boolean);
+          const parsed = rows.map((row) => {
+            const [name, path, status, requestId, snippet] = row.split('\t');
+            return { name, path, status: Number(status), requestId, snippet };
+          });
+          const markdown = parsed.map((probe) => {
+            const snippet = String(probe.snippet || '').replaceAll('|', '\\|');
+            return `| ${probe.name} | \`${probe.path}\` | \`${probe.status}\` | \`${probe.requestId}\` | \`${snippet}\` |`;
+          }).join('\n');
+          const hasIssue = parsed.some((probe) => probe.status >= 400 || probe.status === 0);
+          console.log('probes<<EOF');
+          console.log(markdown);
+          console.log('EOF');
+          console.log(`has_issue=${hasIssue ? 'true' : 'false'}`);
+          NODE
+
+      - name: Query WOBS metrics
+        id: wobs
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p preview-output
+          sleep 15
+
+          SINCE=$(node -e 'console.log(new Date(Date.now() - 20 * 60 * 1000).toISOString())')
+          QUERY=$(jq -nc \
+            --arg accountTag "$CLOUDFLARE_ACCOUNT_ID" \
+            --arg since "$SINCE" \
+            '{
+              query: "query PreviewMetrics($accountTag: string!, $since: Time!) { viewer { accounts(filter: {accountTag: $accountTag}) { workersInvocationsAdaptive(filter: {datetime_geq: $since, isPreview: 1}, limit: 10, orderBy: [datetime_DESC]) { dimensions { datetime scriptName previewSlug status } sum { requests errors } } } } }",
+              variables: { accountTag: $accountTag, since: $since }
+            }')
+
+          curl -sS "https://api.cloudflare.com/client/v4/graphql" \
+            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            --data-binary "$QUERY" \
+            --output preview-output/wobs-metrics.json || true
+
+          node <<'NODE' >> "$GITHUB_OUTPUT"
+          const fs = require('node:fs');
+          let body;
+          try {
+            body = JSON.parse(fs.readFileSync('preview-output/wobs-metrics.json', 'utf8'));
+          } catch (error) {
+            body = { errors: [{ message: `Could not parse GraphQL response: ${error.message}` }] };
+          }
+
+          const rows = body?.data?.viewer?.accounts?.[0]?.workersInvocationsAdaptive || [];
+          let markdown;
+          if (body?.errors?.length) {
+            markdown = `| GraphQL metrics | error | \`${JSON.stringify(body.errors).replaceAll('|', '\\|')}\` |`;
+          } else if (!rows.length) {
+            markdown = '| GraphQL metrics | no rows | `No preview invocation rows returned for the recent window.` |';
+          } else {
+            markdown = rows.map((row) => {
+              const dimensions = row.dimensions || {};
+              const sum = row.sum || {};
+              return `| GraphQL metrics | \`${dimensions.status || 'unknown'}\` | \`${dimensions.datetime || 'unknown'} script=${dimensions.scriptName || 'unknown'} preview=${dimensions.previewSlug || 'unknown'} requests=${sum.requests ?? 'unknown'} errors=${sum.errors ?? 'unknown'}\` |`;
+            }).join('\n');
+          }
+
+          console.log('metrics<<EOF');
+          console.log(markdown);
+          console.log('EOF');
+          NODE
+
+      - name: Publish screenshot for PR comment
+        id: publish-screenshot
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          ARTIFACT_BRANCH: sensor-artifacts-pr-${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          WORKTREE=$(mktemp -d)
+          if git ls-remote --exit-code --heads origin "$ARTIFACT_BRANCH" >/dev/null 2>&1; then
+            git fetch origin "$ARTIFACT_BRANCH"
+            git worktree add "$WORKTREE" "origin/$ARTIFACT_BRANCH"
+          else
+            git worktree add --detach "$WORKTREE"
+            git -C "$WORKTREE" switch --orphan "$ARTIFACT_BRANCH"
+            git -C "$WORKTREE" rm -rf . >/dev/null 2>&1 || true
+          fi
+
+          mkdir -p "$WORKTREE/screenshots"
+          SCREENSHOT_FILE="${GITHUB_SHA}.png"
+          cp preview-output/screenshot.png "$WORKTREE/screenshots/${SCREENSHOT_FILE}"
+          cp preview-output/screenshot.png "$WORKTREE/screenshots/latest.png"
+          git -C "$WORKTREE" add "screenshots/${SCREENSHOT_FILE}" screenshots/latest.png
+          git -C "$WORKTREE" commit -m "Update sensor screenshot for PR ${PR_NUMBER}" || true
+          git -C "$WORKTREE" push origin "HEAD:$ARTIFACT_BRANCH"
+
+          SCREENSHOT_URL="https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${ARTIFACT_BRANCH}/screenshots/${SCREENSHOT_FILE}"
+          echo "screenshot_url=$SCREENSHOT_URL" >> "$GITHUB_OUTPUT"
+
+      - name: Comment sensor evidence on PR
+        uses: actions/github-script@v7
+        env:
+          PREVIEW_URL: ${{ steps.deploy.outputs.preview_url }}
+          DEPLOYMENT_ID: ${{ steps.deploy.outputs.deployment_id }}
+          SCREENSHOT_URL: ${{ steps.publish-screenshot.outputs.screenshot_url }}
+          DEBUG_ID: ${{ steps.screenshot.outputs.debug_id }}
+          CAPTURE_SOURCE: ${{ steps.screenshot.outputs.capture_source }}
+          PROBES: ${{ steps.runtime-probe.outputs.probes }}
+          HAS_ISSUE: ${{ steps.runtime-probe.outputs.has_issue }}
+          METRICS: ${{ steps.wobs.outputs.metrics }}
+        with:
+          script: |
+            const marker = '<!-- worker-preview-sensor:astro-preview-agent-eval -->';
+            const previewName = `pr-${context.issue.number}`;
+            const branch = context.payload.pull_request.head.ref;
+            const sha = context.payload.pull_request.head.sha.slice(0, 7);
+            const wobsPath = `/workers/services/view/${process.env.WORKER_NAME}/production/previews/${previewName}/observability/events`;
+            const verdict = process.env.HAS_ISSUE === 'true'
+              ? 'Potential runtime issue detected by sensor probes.'
+              : 'Sensor probes did not detect an HTTP failure.';
+
+            const body = `${marker}
+            ## Preview Sensor
+
+            ${verdict}
+
+            [Open the latest Preview](${process.env.PREVIEW_URL})
+
+            ![Automated screenshot of the Preview](${process.env.SCREENSHOT_URL})
+
+            | Field | Value |
+            | --- | --- |
+            | Preview | \`${previewName}\` |
+            | Branch | \`${branch}\` |
+            | Commit | \`${sha}\` |
+            | Deployment | \`${process.env.DEPLOYMENT_ID || 'unknown'}\` |
+            | Worker | \`${process.env.WORKER_NAME}\` |
+            | Debug ID | \`${process.env.DEBUG_ID}\` |
+            | Screenshot source | \`${process.env.CAPTURE_SOURCE}\` |
+            | WOBS path | \`${wobsPath}\` |
+
+            ### Runtime Probes
+
+            | Probe | Path | Status | Request ID | Response snippet |
+            | --- | --- | --- | --- | --- |
+            ${process.env.PROBES}
+
+            ### WOBS / Metrics Check
+
+            | Source | Status | Detail |
+            | --- | --- | --- |
+            ${process.env.METRICS}
+            | WOBS log snippets | unavailable via this workflow | \`The standard GraphQL metrics endpoint does not expose persisted console-log snippets or request IDs. Use the WOBS path above with the debug/request IDs from the probes for full logs/traces.\` |`;
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              per_page: 100,
+            });
+            const existing = comments.find((comment) => comment.body?.includes(marker));
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+
+  cleanup:
+    if: github.event_name == 'pull_request' && github.event.action == 'closed' && contains(github.event.pull_request.labels.*.name, 'sensor')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Delete sensor screenshot branch
+        env:
+          ARTIFACT_BRANCH: sensor-artifacts-pr-${{ github.event.pull_request.number }}
+        run: git push origin --delete "$ARTIFACT_BRANCH" || true
