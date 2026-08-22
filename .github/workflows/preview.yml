@@ -197,7 +197,7 @@ jobs:
 
             [Open the latest Preview](${process.env.PREVIEW_URL})
 
-            ![Browser Run screenshot of the Preview](${process.env.SCREENSHOT_URL})
+            ![Automated screenshot of the Preview](${process.env.SCREENSHOT_URL})
 
             | Field | Value |
             | --- | --- |
