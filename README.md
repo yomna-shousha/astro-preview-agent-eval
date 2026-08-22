@@ -1,8 +1,8 @@
 # Astro Preview Agent Eval
 
-Small public harness for testing whether an agent can diagnose a Preview-only issue from GitHub PR evidence.
+Small public harness for testing whether an agent can diagnose a Preview-only issue by collecting its own evidence.
 
-The workflow deploys a Worker Preview, captures a screenshot, sends correlated runtime requests, and posts an evidence-only PR comment with WOBS/debug/request IDs.
+The workflow only deploys a Worker Preview and posts the Preview coordinates. It intentionally does not capture screenshots, send application probes, query WOBS, or provide request IDs. The investigating agent must do that work itself.
 
 ## Commands
 
@@ -14,4 +14,4 @@ The workflow deploys a Worker Preview, captures a screenshot, sends correlated r
 
 ## Agent Eval
 
-Use `AGENT_EVAL_PROMPT.md` against the intentionally broken PR after the Preview Evidence comment appears.
+Use `AGENT_EVAL_PROMPT.md` against the intentionally broken PR after the Preview Coordinates comment appears.
