@@ -197,17 +197,18 @@ jobs:
         env:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          PREVIEW_NAME: pr-${{ github.event.pull_request.number }}
         run: |
           set -euo pipefail
           mkdir -p preview-output
-          sleep 15
+          sleep 60
 
-          SINCE=$(node -e 'console.log(new Date(Date.now() - 20 * 60 * 1000).toISOString())')
+          SINCE=$(node -e 'console.log(new Date(Date.now() - 120 * 60 * 1000).toISOString())')
           QUERY=$(jq -nc \
             --arg accountTag "$CLOUDFLARE_ACCOUNT_ID" \
             --arg since "$SINCE" \
             '{
-              query: "query PreviewMetrics($accountTag: string!, $since: Time!) { viewer { accounts(filter: {accountTag: $accountTag}) { workersInvocationsAdaptive(filter: {datetime_geq: $since, isPreview: 1}, limit: 10, orderBy: [datetime_DESC]) { dimensions { datetime scriptName previewSlug status } sum { requests errors } } } } }",
+              query: "query PreviewMetrics($accountTag: string!, $since: Time!) { viewer { accounts(filter: {accountTag: $accountTag}) { workersInvocationsAdaptive(filter: {datetime_geq: $since, isPreview: 1}, limit: 50, orderBy: [datetime_DESC]) { dimensions { datetime scriptName previewSlug status } sum { requests errors } } } } }",
               variables: { accountTag: $accountTag, since: $since }
             }')
 
@@ -227,13 +228,21 @@ jobs:
           }
 
           const rows = body?.data?.viewer?.accounts?.[0]?.workersInvocationsAdaptive || [];
+          const previewName = process.env.PREVIEW_NAME;
+          const workerName = process.env.WORKER_NAME;
+          const relevantRows = rows.filter((row) => {
+            const dimensions = row.dimensions || {};
+            const previewMatches = dimensions.previewSlug === previewName || dimensions.previewSlug === '__unknown__';
+            const workerMatches = dimensions.scriptName === workerName || dimensions.scriptName === '__unknown__';
+            return previewMatches && workerMatches;
+          }).slice(0, 10);
           let markdown;
           if (body?.errors?.length) {
             markdown = `| GraphQL metrics | error | \`${JSON.stringify(body.errors).replaceAll('|', '\\|')}\` |`;
-          } else if (!rows.length) {
+          } else if (!relevantRows.length) {
             markdown = '| GraphQL metrics | no rows | `No preview invocation rows returned for the recent window.` |';
           } else {
-            markdown = rows.map((row) => {
+            markdown = relevantRows.map((row) => {
               const dimensions = row.dimensions || {};
               const sum = row.sum || {};
               return `| GraphQL metrics | \`${dimensions.status || 'unknown'}\` | \`${dimensions.datetime || 'unknown'} script=${dimensions.scriptName || 'unknown'} preview=${dimensions.previewSlug || 'unknown'} requests=${sum.requests ?? 'unknown'} errors=${sum.errors ?? 'unknown'}\` |`;
