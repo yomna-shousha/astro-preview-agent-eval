@@ -1,0 +1,19 @@
+.github/workflows/preview-sensor.yml
+  s_49c7d32c522411::t_0c5708d403a5db 200,204,206,211,231-238,242,245
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "23000241997a19ec130be564f7673ee4baca3e80",
+  "prompts": {},
+  "sessions": {
+    "s_49c7d32c522411": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_ff8caa94cffeion3nBnj9sj017",
+        "model": "gpt-5.5"
+      },
+      "human_author": "yomna <yomna@cloudflare.com>"
+    }
+  }
+}
