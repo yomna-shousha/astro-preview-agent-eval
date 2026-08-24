@@ -4,6 +4,11 @@
   "main": "src/worker.js",
   "compatibility_date": "2026-06-24",
   "workers_dev": true,
+  "tail_consumers": [
+    {
+      "service": "preview-tail-sink"
+    }
+  ],
   "assets": {
     "directory": "./dist",
     "binding": "ASSETS"
@@ -25,6 +30,11 @@
     "APP_ENV": "production"
   },
   "previews": {
+    "tail_consumers": [
+      {
+        "service": "preview-tail-sink"
+      }
+    ],
     "observability": {
       "enabled": true,
       "logs": {
