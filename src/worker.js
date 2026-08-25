@@ -12,12 +12,13 @@ export default {
 
     if (url.pathname === "/api/catalog/sync") {
       const event = {
-        ...baseEvent("catalog_sync_succeeded", request, env, requestId, debugId),
-        itemCount: 12,
-        staleItems: 0,
+        ...baseEvent("catalog_sync_failed", request, env, requestId, debugId),
+        reason: "demo-regression",
+        itemCount: 0,
+        staleItems: 12,
       };
       console.log(event);
-      return json({ ok: true, requestId, debugId, synced: true, itemCount: 12 });
+      return json({ ok: false, requestId, debugId, synced: false, error: "catalog sync failed" }, 500);
     }
 
     if (url.pathname === "/api/checkout/quote") {
